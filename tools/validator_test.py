@@ -23,6 +23,17 @@ import tensorflow as tf
 import validator
 import yaml_parser
 
+ARCHITECTURE_YAML = """
+values:
+  - id: bert
+    display_name: BERT
+  - id: transformer
+    display_name: Transformer"""
+
+COLAB_YAML = """
+format: url
+required_domain: colab.research.google.com"""
+
 DATASET_YAML = """
 values:
   - id: mnist
@@ -30,12 +41,8 @@ values:
   - id: wikipedia
     display_name: Wikipedia"""
 
-ARCHITECTURE_YAML = """
-values:
-  - id: bert
-    display_name: BERT
-  - id: transformer
-    display_name: Transformer"""
+DEMO_YAML = """
+format: url"""
 
 LANGUAGE_YAML = """
 values:
@@ -70,12 +77,14 @@ values:
 """
 
 TAG_FILE_NAME_TO_CONTENT_MAP = {
-    "network_architecture.yaml": ARCHITECTURE_YAML,
+    "colab.yaml": COLAB_YAML,
     "dataset.yaml": DATASET_YAML,
+    "demo.yaml": DEMO_YAML,
+    "interactive_visualizer.yaml": VISUALIZER_YAML,
     "language.yaml": LANGUAGE_YAML,
     "license.yaml": LICENSE_YAML,
-    "task.yaml": TASK_YAML,
-    "interactive_visualizer.yaml": VISUALIZER_YAML
+    "network_architecture.yaml": ARCHITECTURE_YAML,
+    "task.yaml": TASK_YAML
 }
 
 LEGACY_VALUE = "legacy"
@@ -140,7 +149,7 @@ multiple lines.
 <!-- fine-tunable:true -->
 <!-- format: saved_model_2 -->
 <!-- dataset: mnist -->
-<!-- interactive-model-name: vision -->
+<!-- interactive-visualizer: vision -->
 <!-- language: en -->
 <!-- network-architecture: bert -->
 <!-- license: apache-2.0 -->
@@ -170,7 +179,7 @@ multiple lines.
 
 <!-- dataset: mnist -->
 <!-- fine-tunable:true -->
-<!-- interactive-model-name: vision -->
+<!-- interactive-visualizer: vision -->
 <!-- language: en -->
 <!-- task:   text-embedding   -->
 <!-- network-architecture: bert -->
@@ -257,6 +266,9 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
       self.set_content(f"root/tags/{file_name}", content)
     self.asset_path_modified = mock.patch.object(
         validator, "_is_asset_path_modified", return_value=True)
+    self.enumerable_parser = yaml_parser.EnumerableYamlParser(
+        self.tmp_root_dir, "language")
+    self.parser_by_tag = {"language": self.enumerable_parser}
     self.asset_path_modified.start()
     self.addCleanup(self.asset_path_modified.stop)
 
@@ -285,6 +297,27 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
 
     model = MultiplyTimesTwoModel()
     tf.saved_model.save(model, path)
+
+  @parameterized.parameters(
+      ("# Module google/ALBERT/1", validator.SavedModelParsingPolicy),
+      ("# Placeholder google/ALBERT/1", validator.PlaceholderParsingPolicy),
+      ("# Lite google/ALBERT/1", validator.LiteParsingPolicy),
+      ("# Tfjs google/ALBERT/1", validator.TfjsParsingPolicy),
+      ("# Coral google/ALBERT/1", validator.CoralParsingPolicy),
+      ("# Publisher google", validator.PublisherParsingPolicy),
+      ("# Collection google/experts/1", validator.CollectionParsingPolicy))
+  def test_get_policy_from_string(self, document_string, expected_policy):
+    self.assertIsInstance(
+        validator.ParsingPolicy.from_string(document_string,
+                                            self.parser_by_tag),
+        expected_policy)
+
+  def test_fail_getting_policy_from_unknown_string(self):
+    with self.assertRaisesRegex(
+        validator.MarkdownDocumentationError,
+        ".*Instead the first\nline is '# Newmodel google/ALBERT/1'"):
+      validator.ParsingPolicy.from_string("# Newmodel google/ALBERT/1",
+                                          self.parser_by_tag)
 
   def test_markdown_parsed_saved_model(self):
     empty_second_line = textwrap.dedent(f"""\
@@ -565,12 +598,10 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
                      self.minimal_markdown)
     self.set_up_publisher_page("google")
     documentation_parser = validator.DocumentationParser(
-        self.tmp_root_dir, self.tmp_docs_dir)
-    parser = yaml_parser.YamlParser(self.tmp_root_dir)
+        self.tmp_root_dir, self.tmp_docs_dir, self.parser_by_tag)
 
     documentation_parser.validate(
         validation_config=self.validation_config,
-        yaml_parser=parser,
         file_path=self.get_full_path(
             "root/assets/docs/google/models/text-embedding-model/1.md"))
 
@@ -638,7 +669,7 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
   @parameterized.parameters(
       ("Open Colab notebook", "https://colab.research.google.com"),
       ("Open Demo", "https://teachablemachine.withgoogle.com/train/pose"))
-  def test_markdown_buttons(self, button_text, button_value):
+  def test_fail_on_deprecated_markdown_buttons(self, button_text, button_value):
     content = textwrap.dedent(f"""\
       # Module google/text-embedding-model/1
       One line description.
@@ -653,8 +684,11 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
     self.set_content("root/assets/docs/google/models/model/1.md", content)
     self.set_up_publisher_page("google")
 
-    validator.validate_documentation_dir(
-        validation_config=self.validation_config, root_dir=self.tmp_root_dir)
+    with self.assertRaisesRegex(
+        validator.MarkdownDocumentationError,
+        rf".*Unexpected line found: '\[!\[{button_text}"):
+      validator.validate_documentation_dir(
+          validation_config=self.validation_config, root_dir=self.tmp_root_dir)
 
   def test_markdown_with_bad_module_type(self):
     content = textwrap.dedent("""\
@@ -671,8 +705,10 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
     self.set_content("root/assets/docs/google/models/model/1.md", content)
     self.set_up_publisher_page("google")
 
-    with self.assertRaisesRegex(validator.MarkdownDocumentationError,
-                                ".*metadata has to start with.*"):
+    with self.assertRaisesRegex(
+        validator.MarkdownDocumentationError,
+        "The 'task' metadata has to start with any of 'image-', 'text', "
+        "'audio-', 'video-', but is: 'something-embedding'"):
       validator.validate_documentation_dir(
           validation_config=self.validation_config, root_dir=self.tmp_root_dir)
 
@@ -708,7 +744,7 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
   @parameterized.parameters(SAVED_MODEL_OPTIONAL_TAG_TEMPLATE,
                             TFJS_OPTIONAL_TAG_TEMPLATE,
                             LITE_OPTIONAL_TAG_TEMPLATE)
-  def test_markdown_with_colab_tag(self, template):
+  def test_markdown_with_valid_colab_url(self, template):
     self.set_up_publisher_page("google")
     content = template.format(
         tag_key="colab",
@@ -717,6 +753,22 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
 
     validator.validate_documentation_dir(
         validation_config=self.validation_config, root_dir=self.tmp_root_dir)
+
+  @parameterized.parameters(SAVED_MODEL_OPTIONAL_TAG_TEMPLATE,
+                            TFJS_OPTIONAL_TAG_TEMPLATE,
+                            LITE_OPTIONAL_TAG_TEMPLATE)
+  def test_markdown_with_bad_colab_url_fails(self, template):
+    self.set_up_publisher_page("google")
+    content = template.format(
+        tag_key="colab",
+        tag_value="https://github.com/mycolab.ipynb")
+    self.set_content("root/assets/docs/google/models/model/1.md", content)
+
+    with self.assertRaisesRegex(
+        validator.MarkdownDocumentationError,
+        "URL must lead to domain colab.research.google.com but is github.com"):
+      validator.validate_documentation_dir(
+          validation_config=self.validation_config, root_dir=self.tmp_root_dir)
 
   def test_demo_tag_on_tfjs_model(self):
     self.set_up_publisher_page("google")
@@ -727,9 +779,22 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
     validator.validate_documentation_dir(
         validation_config=self.validation_config, root_dir=self.tmp_root_dir)
 
+  def test_demo_tag_on_tfjs_model_with_unsecure_url_fails(self):
+    self.set_up_publisher_page("google")
+    content = TFJS_OPTIONAL_TAG_TEMPLATE.format(
+        tag_key="demo", tag_value="http://the-unsecure-page.com")
+    self.set_content("root/assets/docs/google/models/model/1.md", content)
+
+    with self.assertRaisesRegex(
+        validator.MarkdownDocumentationError,
+        "http://the-unsecure-page.com is not an HTTPS URL."):
+      validator.validate_documentation_dir(
+          validation_config=self.validation_config, root_dir=self.tmp_root_dir)
+
   @parameterized.parameters(
       ("dataset", "dataset"),
-      ("interactive-model-name", "interactive_visualizer"),
+
+      ("interactive-visualizer", "interactive_visualizer"),
       ("language", "language"),
       ("license", "license"),
       ("network-architecture", "network_architecture"),
@@ -743,6 +808,7 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
 
     with self.assertRaisesRegex(
         validator.MarkdownDocumentationError,
+        f"Validating {tag_key} failed: "
         f"Unsupported values for {tag_key} tag were found: "
         rf"\['n/a'\]. Please add them to tags/{yaml_file_name}.yaml."):
       validator.validate_documentation_dir(
@@ -768,7 +834,8 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
 
   @parameterized.parameters(
       ("dataset", "dataset"),
-      ("interactive-model-name", "interactive_visualizer"),
+
+      ("interactive-visualizer", "interactive_visualizer"),
       ("language", "language"), ("license", "license"),
       ("network-architecture", "network_architecture"))
   def test_placeholder_markdown_with_unsupported_tag_value(
@@ -790,17 +857,15 @@ class ValidatorTest(parameterized.TestCase, tf.test.TestCase):
     self.set_content("root/assets/docs/google/models/text-embedding-model/1.md",
                      self.minimal_markdown)
     self.set_up_publisher_page("google")
-    parser = yaml_parser.YamlParser(self.tmp_root_dir)
     with open(os.path.join(self.model_path, ".invalid_file"), "w") as bad_file:
       bad_file.write("This file shouldn't be here")
     documentation_parser = validator.DocumentationParser(
-        self.tmp_root_dir, self.tmp_docs_dir)
+        self.tmp_root_dir, self.tmp_docs_dir, self.parser_by_tag)
 
     with self.assertRaisesRegex(validator.MarkdownDocumentationError,
                                 r"Invalid filepath.*\.invalid_file"):
       documentation_parser.validate(
           validation_config=validator.ValidationConfig(do_smoke_test=True),
-          yaml_parser=parser,
           file_path=self.get_full_path(
               "root/assets/docs/google/models/text-embedding-model/1.md"))
 
